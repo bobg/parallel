@@ -1,20 +1,37 @@
-package workers
+package parallel
 
 import (
 	"context"
+	"fmt"
+	"sync"
 
 	"golang.org/x/sync/errgroup"
 )
 
+// Error is an error type for wrapping errors returned from worker goroutines.
+// It contains the worker number of the goroutine that produced the error.
 type Error struct {
 	N   int
 	Err error
+}
+
+func (e Error) Error() string {
+	return fmt.Sprintf("in goroutine %d: %s", e.N, e.Err)
 }
 
 func (e Error) Unwrap() error {
 	return e.Err
 }
 
+// Values produces a slice of n values using n parallel workers each running the function f.
+//
+// Each worker receives its worker number (in the range 0 through n-1).
+//
+// An error from any worker cancels them all.
+// The first error is returned to the caller.
+//
+// The resulting slice has length n.
+// The value at position i comes from worker i.
 func Values[T any](ctx context.Context, n int, f func(context.Context, int) (T, error)) ([]T, error) {
 	g, ctx := errgroup.WithContext(ctx)
 	result := make([]T, n)
@@ -37,9 +54,11 @@ func Values[T any](ctx context.Context, n int, f func(context.Context, int) (T, 
 
 // Producers launches n parallel workers each running the function f.
 //
-// Each worker receives its worker number (in the range 0 through n-1)
+// Each worker receives its worker number
+// (in the range 0 through n-1)
 // and a callback to use for producing a value.
-// If the callback returns an error, the worker should exit with that error.
+// If the callback returns an error,
+// the worker should exit with that error.
 //
 // An error from any worker cancels them all.
 //
@@ -80,30 +99,35 @@ func Producers[T any](ctx context.Context, n int, f func(context.Context, int, f
 
 	go func() {
 		err = g.Wait()
-		if wasNil {
-			close(ch)
-		}
+		close(ch)
 	}()
 
 	return func() (T, bool, error) {
-		var zero T
-
-		select {
-		case <-ctx.Done():
-			return zero, false, ctx.Err()
-		case val, ok := <-ch:
-			if !ok {
-				return zero, false, err
-			}
-			return val, true, nil
+		val, ok := <-ch
+		if !ok {
+			var zero T
+			return zero, false, err
 		}
+		return val, true, nil
 	}
 }
 
-func Consumers[T any](ctx context.Context, n int, ch chan T, f func(context.Context, int, T) error) (chan<- T, func() error) {
-	if ch == nil {
-		ch = make(chan T)
-	}
+// Consumers launches n parallel workers each consuming values supplied by the caller.
+//
+// When a value is available,
+// an available worker calls the function f to consume it.
+// This callback receives the worker's number
+// (in the range 0 through n-1)
+// and the value.
+//
+// An error from any worker cancels them all.
+//
+// The caller receives two callbacks:
+// one for sending a value to the workers,
+// and one for closing that channel
+// (signaling the end of input and causing the workers to exit normally).
+func Consumers[T any](ctx context.Context, n int, f func(context.Context, int, T) error) (func(T) error, func() error) {
+	ch := make(chan T, n)
 
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -127,10 +151,52 @@ func Consumers[T any](ctx context.Context, n int, ch chan T, f func(context.Cont
 		})
 	}
 
+	sendfn := func(val T) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ch <- val:
+			return nil
+		}
+	}
+
 	closefn := func() error {
 		close(ch)
 		return g.Wait()
 	}
 
-	return ch, closefn
+	return sendfn, closefn
+}
+
+// Pool permits up to n concurrent calls to a function f.
+// The caller receives a callback for requesting a worker from this pool.
+// When no worker is available,
+// the callback blocks until one becomes available.
+// Then it invokes f and returns the result.
+//
+// Each call of the callback is synchronous.
+// Any desired concurrency is the responsibility of the caller.
+func Pool[T, U any](n int, f func(T) (U, error)) func(T) (U, error) {
+	var (
+		running int
+		mu      sync.Mutex
+		cond    = sync.NewCond(&mu)
+	)
+	return func(val T) (U, error) {
+		mu.Lock()
+		for running >= n {
+			cond.Wait()
+		}
+		running++
+		mu.Unlock()
+
+		result, err := f(val)
+
+		mu.Lock()
+		running--
+		cond.Signal()
+		mu.Unlock()
+
+		return result, err
+	}
 }
